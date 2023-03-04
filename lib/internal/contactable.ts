@@ -5,6 +5,7 @@ import axios from "axios"
 import { Readable } from "stream"
 import { pcm2slk } from 'node-silk';
 import { randomBytes } from "crypto"
+const { AudioContext } = require('web-audio-api')
 import { exec } from "child_process"
 import { tea, pb, ApiRejection } from "../core"
 import { ErrorCode, drop } from "../errors"
@@ -310,7 +311,7 @@ export abstract class Contactable {
 		this.c.logger.debug("开始语音任务")
 		if (typeof elem.file === "string" && elem.file.startsWith("protobuf://"))
 			return elem
-		const buf = await getPttBuffer(elem.file, this.c.config.ffmpeg_path)
+		const buf = await getPttBuffer(elem.file)
 		const hash = md5(buf)
 		const codec = String(buf.slice(0, 7)).includes("SILK") ? 1 : 0
 		const body = pb.encode({
@@ -590,7 +591,7 @@ async function* concatStreams(readable1: Readable, readable2: Readable) {
 		yield chunk
 }
 
-async function getPttBuffer(file: string | Buffer, ffmpeg = "ffmpeg"): Promise<Buffer> {
+async function getPttBuffer(file: string | Buffer): Promise<Buffer> {
 	if (file instanceof Buffer || file.startsWith("base64://")) {
 		// Buffer或base64
 		const buf = file instanceof Buffer ? file : Buffer.from(file.slice(9), "base64")
@@ -600,7 +601,7 @@ async function getPttBuffer(file: string | Buffer, ffmpeg = "ffmpeg"): Promise<B
 		} else {
 			const tmpfile = path.join(TMP_DIR, uuid())
 			await fs.promises.writeFile(tmpfile, buf)
-			return audioTrans(tmpfile, ffmpeg)
+			return audioTrans(tmpfile)
 		}
 	} else if (file.startsWith("http://") || file.startsWith("https://")) {
 		// 网络文件
@@ -613,7 +614,7 @@ async function getPttBuffer(file: string | Buffer, ffmpeg = "ffmpeg"): Promise<B
 			fs.unlink(tmpfile, NOOP)
 			return buf
 		} else {
-			return audioTrans(tmpfile, ffmpeg)
+			return audioTrans(tmpfile)
 		}
 	} else {
 		// 本地文件
@@ -623,23 +624,49 @@ async function getPttBuffer(file: string | Buffer, ffmpeg = "ffmpeg"): Promise<B
 		if (head.includes("SILK") || head.includes("AMR")) {
 			return fs.promises.readFile(file)
 		} else {
-			return audioTrans(file, ffmpeg)
+			return audioTrans(file)
 		}
 	}
 }
 
-function audioTrans(file: string, ffmpeg = "ffmpeg"): Promise<Buffer> {
+function audioTrans(file: string): Promise<Buffer> {
 	return new Promise((resolve, reject) => {
-		const tmpfile = path.join(TMP_DIR, uuid())
-		exec(`${ffmpeg} -i "${file}" -f s16le -ac 1 -ar 24000 "${tmpfile}"`, async (error, stdout, stderr) => {
-			try {
-				resolve(pcm2slk(fs.readFileSync(tmpfile)))
-			} catch {
-				reject(new ApiRejection(ErrorCode.FFmpegPttTransError, "音频转码到pcm失败，请确认你的ffmpeg可以处理此转换"))
-			} finally {
-				fs.unlink(tmpfile, NOOP)
-			}
-		})
+		const context = new AudioContext();
+
+		try {
+			context.decodeAudioData(fs.readFileSync(file), (audioBuffer: AudioBuffer) => {
+				// 编码参数参考 ffmpeg -i input_path -f s16le -ar 24000 -ac 1 output_path
+
+				const channels = 1; // 单声道
+				const rate = 24000; // 采样率为 24000 Hz
+
+				// 更改音频的采样率、声道数和长度
+				const newBuffer = context.createBuffer(
+					channels,
+					audioBuffer.length * rate / audioBuffer.sampleRate,
+					rate
+				);
+
+				const channelData = newBuffer.getChannelData(0);
+				const step = audioBuffer.sampleRate / rate;
+
+				for (let i = 0; i < channelData.length; i++) {
+					const oldIndex = Math.floor(i * step);
+					channelData[i] = audioBuffer.getChannelData(0)[oldIndex];
+				}
+
+				const interleaved = interleave(newBuffer.getChannelData(0));
+				const buffer = new ArrayBuffer(interleaved.length * 2);
+				const view = new DataView(buffer);
+
+				// 将 PCM 数据写入 ArrayBuffer
+				floatTo16BitPCM(view, 0, interleaved);
+
+				resolve(pcm2slk(Buffer.from(buffer)))
+			});
+		} catch {
+			reject(new ApiRejection(ErrorCode.FFmpegPttTransError, "音频转码失败，请确认你的音频格式可以被 Web Audio API 处理，详见 https://developer.mozilla.org/zh-CN/docs/Web/API/Web_Audio_API"))
+		}
 	})
 }
 
@@ -648,4 +675,31 @@ async function read7Bytes(file: string) {
 	const buf = (await fd.read(Buffer.alloc(7), 0, 7, 0)).buffer
 	fd.close()
 	return buf
+}
+
+
+/**
+ * @description 将 PCM 数据从 Float32Array 转换为 Int16Array, channel 的类型可参考下方链接
+ * @see https://github.com/audiojs/web-audio-api/blob/0ede7359f3b9fdb06108327d6c2838be52d2c63e/src/AudioBuffer.js#L27
+ **/
+function interleave(channel: Float32Array) {
+	const buffer = new ArrayBuffer(channel.length * 2);
+	const int16Array = new Int16Array(buffer);
+
+	for (let i = 0; i < channel.length; i++) {
+		const floatValue = channel[i];
+		const intValue = Math.max(-1, Math.min(1, floatValue)) * 0x7fff;
+		int16Array[i] = intValue;
+	}
+
+	return int16Array;
+}
+
+// 将 PCM 数据从 Int16Array 转换为 S16LE 格式的二进制数据
+function floatTo16BitPCM(output: DataView, offset: number, input: Int16Array) {
+	for (let i = 0; i < input.length; i++, offset += 2) {
+		const floatValue = input[i];
+		const intValue = Math.max(-0x8000, Math.min(0x7fff, floatValue));
+		output.setInt16(offset, intValue, true);
+	}
 }
